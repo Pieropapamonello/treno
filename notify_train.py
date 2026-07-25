@@ -703,6 +703,11 @@ def handle_bot_command(message):
     text = message.get("text", "").strip()
     chat_config = get_chat_config(chat_id)
     train_label = chat_config["train_label"]
+    pending_action = chat_config.get("pending_action")
+
+    # Ignore plain text if there is no pending action and no command.
+    if not text.startswith("/") and not pending_action:
+        return
 
     if text.startswith("/start"):
         send_telegram_message(build_welcome_text(), chat_id=chat_id, reply_markup=build_menu_keyboard())
