@@ -25,12 +25,17 @@ STATE_FILE_PATH = os.getenv("STATE_FILE_PATH", "train_state.json")
 SEND_ONLY_ON_CHANGE = os.getenv("SEND_ONLY_ON_CHANGE", "true").lower() in {"1", "true", "yes", "on"}
 START_SCHEDULER = os.getenv("START_SCHEDULER", "true").lower() in {"1", "true", "yes", "on"}
 GUNICORN_WORKER_ID = os.getenv("GUNICORN_WORKER_ID")
+HTTP_RETRY_COUNT = int(os.getenv("HTTP_RETRY_COUNT", "2"))
+HTTP_BACKOFF_SECONDS = int(os.getenv("HTTP_BACKOFF_SECONDS", "1"))
 
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
 
 # basic logging for debugging webhook/commands
 logging.basicConfig(level=logging.INFO)
+
+# lock for thread-safe state access
+STATE_LOCK = threading.Lock()
 
 
 def format_millis(timestamp_ms):
@@ -62,32 +67,6 @@ def build_rest_api_url(train_url):
             prefix = parsed.path.rsplit("/", 1)[0]
         return f"{base}{prefix}/resteasy/viaggiatreno/andamentoTreno/{origine}/{numero_treno}/{data_partenza}"
     return None
-
-
-def fetch_train_page():
-    response = requests.get(
-        TRAIN_URL,
-        timeout=15,
-        headers={"User-Agent": "Mozilla/5.0"},
-    )
-    response.raise_for_status()
-    return response.text
-
-
-def fetch_train_data():
-    api_url = build_rest_api_url(TRAIN_URL)
-    if api_url:
-        response = requests.get(
-            api_url,
-            timeout=15,
-            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
-        )
-        response.raise_for_status()
-        try:
-            return response.json()
-        except ValueError:
-            return response.text
-    return fetch_train_page()
 
 
 def parse_train_info_html(html):
@@ -279,22 +258,24 @@ def should_send_change_notification(info, prev_info):
 
 
 def load_state():
-    try:
-        with open(STATE_FILE_PATH, "r", encoding="utf-8") as fp:
-            return json.load(fp)
-    except FileNotFoundError:
-        return {}
-    except Exception as exc:
-        print(f"Warning: cannot read state file: {exc}")
-        return {}
+    with STATE_LOCK:
+        try:
+            with open(STATE_FILE_PATH, "r", encoding="utf-8") as fp:
+                return json.load(fp)
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            logging.warning("Cannot read state file: %s", exc)
+            return {}
 
 
 def save_state(state):
-    try:
-        with open(STATE_FILE_PATH, "w", encoding="utf-8") as fp:
-            json.dump(state, fp, indent=2, ensure_ascii=False)
-    except Exception as exc:
-        print(f"Warning: cannot save state file: {exc}")
+    with STATE_LOCK:
+        try:
+            with open(STATE_FILE_PATH, "w", encoding="utf-8") as fp:
+                json.dump(state, fp, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            logging.warning("Cannot save state file: %s", exc)
 
 
 def get_chat_key(chat_id):
@@ -315,11 +296,12 @@ def get_chat_config(chat_id):
         "pending_action": chat.get("pending_action"),
         "check_interval_minutes": chat.get("check_interval_minutes", 1),
         "notifications_enabled": chat.get("notifications_enabled", True),
+        "send_only_on_change": chat.get("send_only_on_change", SEND_ONLY_ON_CHANGE),
         "train_arrived": chat.get("train_arrived", False),
     }
 
 
-def set_chat_config(chat_id, train_label=None, train_url=None, pending_action=None, check_interval_minutes=None, notifications_enabled=None, train_arrived=None):
+def set_chat_config(chat_id, train_label=None, train_url=None, pending_action=None, check_interval_minutes=None, notifications_enabled=None, send_only_on_change=None, train_arrived=None):
     state = load_state()
     chats = state.setdefault("chats", {})
     chat = chats.setdefault(get_chat_key(chat_id), {})
@@ -340,6 +322,11 @@ def set_chat_config(chat_id, train_label=None, train_url=None, pending_action=No
         chat["notifications_enabled"] = bool(notifications_enabled)
     else:
         chat.setdefault("notifications_enabled", True)
+    # send-on-change flag
+    if send_only_on_change is not None:
+        chat["send_only_on_change"] = bool(send_only_on_change)
+    else:
+        chat.setdefault("send_only_on_change", SEND_ONLY_ON_CHANGE)
     # train arrived flag
     if train_arrived is not None:
         chat["train_arrived"] = bool(train_arrived)
@@ -385,15 +372,48 @@ def normalize_train_label(text):
     return match.group(0) if match else None
 
 
+def extract_command(message):
+    text = message.get("text", "").strip()
+    entities = message.get("entities", []) or []
+    for entity in entities:
+        if entity.get("type") == "bot_command" and entity.get("offset") == 0:
+            length = entity.get("length", 0)
+            command_text = text[:length]
+            command = command_text.split("@")[0]
+            args = text[length:].strip()
+            return command, args
+
+    if not text.startswith("/"):
+        return None, None
+
+    parts = text.split(maxsplit=1)
+    command = parts[0].split("@")[0]
+    args = parts[1].strip() if len(parts) > 1 else ""
+    return command, args
+
+
+def fetch_with_retry(url, headers=None, timeout=15, params=None):
+    headers = headers or {"User-Agent": "Mozilla/5.0"}
+    for attempt in range(1, HTTP_RETRY_COUNT + 2):
+        try:
+            response = requests.get(url, headers=headers, timeout=timeout, params=params)
+            response.raise_for_status()
+            return response
+        except requests.RequestException as exc:
+            if attempt > HTTP_RETRY_COUNT:
+                raise
+            logging.warning("Request failed (%s) attempt %s/%s: %s", url, attempt, HTTP_RETRY_COUNT + 1, exc)
+            time.sleep(HTTP_BACKOFF_SECONDS * attempt)
+
+
 def fetch_train_page(train_url=None):
     if train_url is None:
         train_url = TRAIN_URL
-    response = requests.get(
+    response = fetch_with_retry(
         train_url,
-        timeout=15,
         headers={"User-Agent": "Mozilla/5.0"},
+        timeout=15,
     )
-    response.raise_for_status()
     return response.text
 
 
@@ -408,12 +428,11 @@ def fetch_train_data(train_url=None, train_label=None):
             api_url = custom_api
     logging.info("fetch_train_data called: train_url=%s train_label=%s api_url=%s", train_url, train_label, api_url)
     if api_url:
-        response = requests.get(
+        response = fetch_with_retry(
             api_url,
-            timeout=15,
             headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            timeout=15,
         )
-        response.raise_for_status()
         try:
             return response.json()
         except ValueError:
@@ -481,8 +500,18 @@ def build_menu_keyboard():
                 {"text": "🔄 Aggiorna ora", "callback_data": "CHECK_NOW"},
                 {"text": "📡 Ultimo stato", "callback_data": "STATUS"},
             ],
-            [{"text": "✏️ Imposta treno", "callback_data": "SET_TRAIN"}, {"text": "⏱ Frequenza", "callback_data": "SET_INTERVAL"}],
-            [{"text": "🔕 Disattiva notifiche", "callback_data": "DISABLE_NOTIF"}, {"text": "🔔 Riattiva notifiche", "callback_data": "ENABLE_NOTIF"}],
+            [
+                {"text": "✏️ Imposta treno", "callback_data": "SET_TRAIN"},
+                {"text": "🌐 Imposta URL", "callback_data": "SET_URL"},
+            ],
+            [
+                {"text": "⏱ Frequenza", "callback_data": "SET_INTERVAL"},
+                {"text": "📣 Sempre", "callback_data": "SEND_ALWAYS"},
+            ],
+            [
+                {"text": "🔕 Disattiva notifiche", "callback_data": "DISABLE_NOTIF"},
+                {"text": "🔔 Riattiva notifiche", "callback_data": "ENABLE_NOTIF"},
+            ],
             [{"text": "ℹ️ Aiuto", "callback_data": "HELP"}],
         ]
     }
@@ -499,7 +528,15 @@ def build_welcome_text():
 def build_help_text():
     return (
         "🛤️ Comandi disponibili:\n"
+        "/start - Mostra il menu iniziale\n"
         "/settrain [numero] - Imposta il treno da seguire\n"
+        "/seturl [url] - Imposta l'URL della pagina del treno\n"
+        "/setinterval [minuti] - Imposta la frequenza di controllo\n"
+        "/sendonchange - Invia messaggi solo su cambiamento\n"
+        "/sendalways - Invia messaggi ad ogni controllo\n"
+        "/settings - Mostra le impostazioni correnti\n"
+        "/disable - Disattiva le notifiche per questo treno\n"
+        "/enable - Riattiva le notifiche per questo treno\n"
         "/check - Controlla lo stato del treno ora\n"
         "/status - Mostra l’ultimo stato salvato\n"
         "/help - Mostra questa guida\n\n"
@@ -507,8 +544,8 @@ def build_help_text():
     )
 
 
-def build_message(info, prev_info, force=False, train_label=None):
-    if force or not SEND_ONLY_ON_CHANGE:
+def build_message(info, prev_info, force=False, train_label=None, send_only_on_change=SEND_ONLY_ON_CHANGE):
+    if force or not send_only_on_change:
         return build_status_text(info, train_label=train_label)
     if not prev_info:
         return build_status_text(info, train_label=train_label)
@@ -532,18 +569,20 @@ def check_train_state(force=False, chat_id=None):
 
     data = fetch_train_data(train_url=train_url, train_label=train_label)
     info = parse_train_info(data)
-    message = build_message(info, {} if force else prev_info, force=force, train_label=train_label)
+    send_only_on_change = SEND_ONLY_ON_CHANGE if chat_id is None else get_chat_config(chat_id)["send_only_on_change"]
+    message = build_message(info, {} if force else prev_info, force=force, train_label=train_label, send_only_on_change=send_only_on_change)
 
     if chat_id is None:
         state["last_info"] = info
+        save_state(state)
     else:
         state = load_state()
         chats = state.setdefault("chats", {})
         chat = chats.setdefault(get_chat_key(chat_id), {})
         chat["last_info"] = info
         chats[get_chat_key(chat_id)] = chat
+        save_state(state)
 
-    save_state(state)
     return {
         "train_label": train_label,
         "train_url": train_url,
@@ -684,7 +723,12 @@ def register_bot_commands():
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setMyCommands"
     payload = {
         "commands": [
+            {"command": "start", "description": "Mostra il menu iniziale"},
             {"command": "settrain", "description": "Imposta il treno da seguire"},
+            {"command": "setinterval", "description": "Imposta la frequenza di controllo"},
+            {"command": "settings", "description": "Mostra le impostazioni correnti"},
+            {"command": "disable", "description": "Disattiva le notifiche per questo treno"},
+            {"command": "enable", "description": "Riattiva le notifiche per questo treno"},
             {"command": "menu", "description": "Apri il menu dei pulsanti"},
             {"command": "check", "description": "Controlla lo stato del treno ora"},
             {"command": "status", "description": "Mostra l'ultimo stato salvato"},
@@ -698,33 +742,48 @@ def register_bot_commands():
         logging.warning("Failed to register bot commands: %s", exc)
 
 
+def build_settings_text(chat_id):
+    config = get_chat_config(chat_id)
+    return (
+        f"⚙️ Impostazioni correnti:\n"
+        f"Treno: {config['train_label']}\n"
+        f"URL: {config['train_url']}\n"
+        f"Frequenza: {config['check_interval_minutes']} minuto(i)\n"
+        f"Notifiche: {'attive' if config['notifications_enabled'] else 'disattivate'}\n"
+        f"Invia solo su cambiamento: {'sì' if config['send_only_on_change'] else 'no'}\n"
+        f"Stato arrivo: {'sì' if config['train_arrived'] else 'no'}"
+    )
+
+
 def handle_bot_command(message):
     chat_id = message["chat"]["id"]
-    text = message.get("text", "").strip()
+    command, args = extract_command(message)
     chat_config = get_chat_config(chat_id)
     train_label = chat_config["train_label"]
     pending_action = chat_config.get("pending_action")
 
-    # Ignore plain text if there is no pending action and no command.
-    if not text.startswith("/") and not pending_action:
+    if not command and not pending_action:
         return
 
-    if text.startswith("/start"):
+    if command == "/start":
         send_telegram_message(build_welcome_text(), chat_id=chat_id, reply_markup=build_menu_keyboard())
         return
 
-    if text.startswith("/help"):
+    if command == "/help":
         send_telegram_message(build_help_text(), chat_id=chat_id, reply_markup=build_menu_keyboard())
         return
 
-    if text.startswith("/menu"):
+    if command == "/menu":
         send_telegram_message("Seleziona un'azione dal menu:", chat_id=chat_id, reply_markup=build_menu_keyboard())
         return
 
-    if text.startswith("/settrain"):
-        parts = text.split(maxsplit=1)
-        if len(parts) > 1:
-            new_label = normalize_train_label(parts[1])
+    if command == "/settings":
+        send_telegram_message(build_settings_text(chat_id), chat_id=chat_id)
+        return
+
+    if command == "/settrain":
+        if args:
+            new_label = normalize_train_label(args)
             if new_label:
                 set_chat_config(chat_id, train_label=new_label, pending_action=None)
                 send_telegram_message(
@@ -736,12 +795,63 @@ def handle_bot_command(message):
         send_telegram_message("Inserisci il numero del treno da seguire.", chat_id=chat_id)
         return
 
-    if text.startswith("/check"):
+    if command == "/seturl":
+        if args:
+            if args.startswith("http://") or args.startswith("https://"):
+                set_chat_config(chat_id, train_url=args, pending_action=None)
+                send_telegram_message(
+                    "URL del treno impostato. Usa /check o /menu per aggiornare lo stato.",
+                    chat_id=chat_id,
+                )
+                return
+            send_telegram_message("URL non valido. Invia un URL che inizi con http:// o https://.", chat_id=chat_id)
+            return
+        set_chat_config(chat_id, pending_action="set_url")
+        send_telegram_message("Invia l'URL completo della pagina del treno.", chat_id=chat_id)
+        return
+
+    if command == "/setinterval":
+        if args:
+            try:
+                minutes = int(re.search(r"(\d+)", args).group(1))
+                if minutes < 1:
+                    raise ValueError
+                set_chat_config(chat_id, check_interval_minutes=minutes, pending_action=None)
+                send_telegram_message(f"Frequenza impostata a {minutes} minuto(i).", chat_id=chat_id)
+                return
+            except Exception:
+                send_telegram_message("Valore non valido. Invia un numero intero (es. '1' per 1 minuto).", chat_id=chat_id)
+                return
+        set_chat_config(chat_id, pending_action="set_interval")
+        send_telegram_message("Invia il numero di minuti per la frequenza di controllo (es. 1).", chat_id=chat_id)
+        return
+
+    if command == "/sendonchange":
+        set_chat_config(chat_id, send_only_on_change=True)
+        send_telegram_message("Impostato per inviare messaggi solo quando lo stato cambia.", chat_id=chat_id)
+        return
+
+    if command == "/sendalways":
+        set_chat_config(chat_id, send_only_on_change=False)
+        send_telegram_message("Impostato per inviare messaggi ad ogni controllo.", chat_id=chat_id)
+        return
+
+    if command == "/disable":
+        set_chat_config(chat_id, notifications_enabled=False)
+        send_telegram_message("Notifiche disattivate per questo treno. Usa /enable per riattivarle.", chat_id=chat_id)
+        return
+
+    if command == "/enable":
+        set_chat_config(chat_id, notifications_enabled=True, train_arrived=False)
+        send_telegram_message("Notifiche riattivate per questo treno.", chat_id=chat_id)
+        return
+
+    if command == "/check":
         result = check_train_state(force=True, chat_id=chat_id)
         send_update_message(build_status_text(result["info"], train_label=result["train_label"]), chat_id=chat_id)
         return
 
-    if text.startswith("/status"):
+    if command == "/status":
         state = get_chat_state(chat_id)
         info = state.get("last_info")
         if not info:
@@ -751,11 +861,9 @@ def handle_bot_command(message):
         send_update_message(build_status_text(info, train_label=train_label), chat_id=chat_id)
         return
 
-    pending_action = chat_config.get("pending_action")
     if pending_action == "set_interval":
-        # expect a number in minutes
         try:
-            minutes = int(re.search(r"(\d+)", text).group(1))
+            minutes = int(re.search(r"(\d+)", message.get("text", "")).group(1))
             if minutes < 1:
                 raise ValueError
             set_chat_config(chat_id, check_interval_minutes=minutes, pending_action=None)
@@ -763,13 +871,23 @@ def handle_bot_command(message):
         except Exception:
             send_telegram_message("Valore non valido. Invia un numero intero (es. '1' per 1 minuto).", chat_id=chat_id)
         return
+
     if pending_action == "set_train":
-        new_label = normalize_train_label(text)
+        new_label = normalize_train_label(message.get("text", ""))
         if new_label:
             set_chat_config(chat_id, train_label=new_label, pending_action=None)
             send_telegram_message(f"Treno aggiornato a {new_label}. Ora puoi usare /check per vedere lo stato.", chat_id=chat_id)
             return
         send_telegram_message("Non ho trovato un numero treno valido. Invia solo il numero del treno.", chat_id=chat_id)
+        return
+
+    if pending_action == "set_url":
+        url_text = message.get("text", "").strip()
+        if url_text.startswith("http://") or url_text.startswith("https://"):
+            set_chat_config(chat_id, train_url=url_text, pending_action=None)
+            send_telegram_message("URL del treno impostato. Usa /check o /menu per aggiornare lo stato.", chat_id=chat_id)
+            return
+        send_telegram_message("URL non valido. Invia un URL che inizi con http:// o https://.", chat_id=chat_id)
         return
 
     send_telegram_message("Non riconosco questo comando. Usa /help per vedere le opzioni.", chat_id=chat_id)
@@ -814,9 +932,21 @@ def handle_callback_query(callback_query):
         answer_callback_query(callback_id)
         return
 
+    if data == "SET_URL":
+        set_chat_config(chat_id, pending_action="set_url")
+        send_telegram_message("Invia l'URL completo della pagina del treno.", chat_id=chat_id, reply_to_message_id=message_id)
+        answer_callback_query(callback_id)
+        return
+
     if data == "SET_INTERVAL":
         set_chat_config(chat_id, pending_action="set_interval")
         send_telegram_message("Invia il numero di minuti per la frequenza di controllo (es. 1).", chat_id=chat_id, reply_to_message_id=message_id)
+        answer_callback_query(callback_id)
+        return
+
+    if data == "SEND_ALWAYS":
+        set_chat_config(chat_id, send_only_on_change=False)
+        send_telegram_message("Impostato per inviare messaggi ad ogni controllo.", chat_id=chat_id, reply_to_message_id=message_id)
         answer_callback_query(callback_id)
         return
 
@@ -849,7 +979,6 @@ def process_telegram_update(update):
 
 
 # Background scheduler to check chats periodically
-STATE_LOCK = threading.Lock()
 
 def scheduler_loop():
     logging.info("Background scheduler started")
@@ -858,7 +987,6 @@ def scheduler_loop():
             state = load_state()
             chats = state.get("chats", {})
             now = time.time()
-            updated = False
             for key, chat in list(chats.items()):
                 try:
                     chat_id = int(key)
@@ -871,18 +999,15 @@ def scheduler_loop():
                 interval = int(chat.get("check_interval_minutes", 1))
                 last_run = chat.get("last_run", 0)
                 if now - float(last_run) >= max(1, interval) * 60:
-                    # update last_run and save early to avoid duplicate runs
                     chat["last_run"] = now
                     chats[key] = chat
                     state["chats"] = chats
                     save_state(state)
-                    updated = False
                     try:
                         result = run_check(force=False, chat_id=chat_id)
                         info = result.get("info", {})
                         status = (info.get("status") or "").lower()
                         if status == "arrivato":
-                            # mark arrived and disable further notifications
                             chat["train_arrived"] = True
                             chat["notifications_enabled"] = False
                             chats[key] = chat
@@ -908,6 +1033,8 @@ def should_start_scheduler():
 if should_start_scheduler():
     _scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
     _scheduler_thread.start()
+
+register_bot_commands()
 
 
 @app.route("/")
@@ -941,6 +1068,11 @@ def check():
 def status():
     state = load_state()
     return jsonify({"last_info": state.get("last_info", {}), "send_only_on_change": SEND_ONLY_ON_CHANGE})
+
+
+@app.route("/health")
+def health():
+    return jsonify({"ok": True, "uptime": int(time.time())})
 
 
 if __name__ == "__main__":

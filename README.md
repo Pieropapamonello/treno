@@ -74,11 +74,16 @@ Quando il treno è impostato per una chat, la configurazione è salvata separata
 
 ## Comandi Telegram disponibili
 
+- `/start` — mostra il menu iniziale con i pulsanti rapidi e le istruzioni.
+- `/help` — mostra la guida completa dei comandi.
 - `/settrain [numero]` — imposta il treno per la chat corrente.
+- `/seturl [url]` — imposta un URL personalizzato per la pagina del treno.
+- `/setinterval [minuti]` — imposta la frequenza di controllo automatica.
+- `/sendonchange` — imposta il bot per inviare messaggi solo quando lo stato cambia.
+- `/sendalways` — imposta il bot per inviare messaggi a ogni controllo.
 - `/menu` — apre la tastiera con pulsanti rapidi (Aggiorna ora, Ultimo stato, Imposta treno, Aiuto).
 - `/check` — richiede un aggiornamento immediato (puoi forzare con `?force=true` se richiesto via HTTP).
 - `/status` — mostra l'ultimo stato salvato per la chat.
-- `/help` — mostra la guida.
 
 ## Come settare il webhook e i comandi (esempi)
 
@@ -92,7 +97,7 @@ Invoke-RestMethod -Uri "https://api.telegram.org/bot$token/getWebhookInfo" | Con
 Esempio per registrare i comandi del bot (usato anche dallo script `notify_train.register_bot_commands()`):
 
 ```bash
-curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setMyCommands" -H "Content-Type: application/json" -d '{"commands":[{"command":"settrain","description":"Imposta il treno da seguire"},{"command":"menu","description":"Apri il menu dei pulsanti"},{"command":"check","description":"Controlla lo stato del treno ora"},{"command":"status","description":"Mostra l\'ultimo stato salvato"},{"command":"help","description":"Mostra la guida del bot"}]}'
+curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setMyCommands" -H "Content-Type: application/json" -d '{"commands":[{"command":"settrain","description":"Imposta il treno da seguire"},{"command":"setinterval","description":"Imposta la frequenza di controllo"},{"command":"settings","description":"Mostra le impostazioni correnti"},{"command":"menu","description":"Apri il menu dei pulsanti"},{"command":"check","description":"Controlla lo stato del treno ora"},{"command":"status","description":"Mostra l\'ultimo stato salvato"},{"command":"help","description":"Mostra la guida del bot"}]}'
 ```
 
 Esempio per impostare il webhook (sostituisci l'URL con quello del tuo servizio su Render):
