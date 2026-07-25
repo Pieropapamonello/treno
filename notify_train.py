@@ -3,6 +3,8 @@ import os
 import re
 import requests
 import logging
+import time
+import threading
 from datetime import datetime
 from urllib.parse import parse_qs, urlparse
 from flask import Flask, jsonify, request
@@ -21,6 +23,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 STATE_FILE_PATH = os.getenv("STATE_FILE_PATH", "train_state.json")
 SEND_ONLY_ON_CHANGE = os.getenv("SEND_ONLY_ON_CHANGE", "true").lower() in {"1", "true", "yes", "on"}
+START_SCHEDULER = os.getenv("START_SCHEDULER", "true").lower() in {"1", "true", "yes", "on"}
+GUNICORN_WORKER_ID = os.getenv("GUNICORN_WORKER_ID")
 
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
@@ -160,12 +164,24 @@ def parse_train_info_json(data):
     fermate = data.get("fermate") or []
     if fermate:
         last_stop = fermate[-1]
+        # capture scheduled/predicted/actual arrival times (keep raw ms for computed times)
         if last_stop.get("arrivoReale") is not None:
             info["destination_arrival_actual"] = format_millis(last_stop.get("arrivoReale"))
-        elif last_stop.get("arrivo_teorico") is not None:
+        if last_stop.get("arrivo_teorico") is not None:
             info["destination_arrival_predicted"] = format_millis(last_stop.get("arrivo_teorico"))
-        elif last_stop.get("programmata") is not None:
-            info["destination_arrival_predicted"] = format_millis(last_stop.get("programmata"))
+        if last_stop.get("programmata") is not None:
+            info["destination_arrival_scheduled"] = format_millis(last_stop.get("programmata"))
+            # compute estimated actual time from scheduled + delay if available
+            try:
+                if info.get("delay_minutes") is not None:
+                    sched_ms = int(last_stop.get("programmata"))
+                    ts = sched_ms / 1000.0 + int(info.get("delay_minutes")) * 60
+                    if ROME_TZ is not None:
+                        info["destination_arrival_computed"] = datetime.fromtimestamp(ts, tz=ROME_TZ).strftime("%H:%M")
+                    else:
+                        info["destination_arrival_computed"] = datetime.utcfromtimestamp(ts).strftime("%H:%M")
+            except Exception:
+                pass
 
         last_reached = None
         for stop in reversed(fermate):
@@ -175,6 +191,20 @@ def parse_train_info_json(data):
         if last_reached:
             info["current_location"] = last_reached.get("stazione")
             info["current_time"] = format_millis(last_reached.get("arrivoReale") or last_reached.get("partenzaReale"))
+            # also capture scheduled time for this stop if present
+            if last_reached.get("programmata") is not None:
+                info["current_time_scheduled"] = format_millis(last_reached.get("programmata"))
+                # compute estimated current time from scheduled + delay if available
+                try:
+                    if info.get("delay_minutes") is not None:
+                        sched_ms = int(last_reached.get("programmata"))
+                        ts = sched_ms / 1000.0 + int(info.get("delay_minutes")) * 60
+                        if ROME_TZ is not None:
+                            info["current_time_computed"] = datetime.fromtimestamp(ts, tz=ROME_TZ).strftime("%H:%M")
+                        else:
+                            info["current_time_computed"] = datetime.utcfromtimestamp(ts).strftime("%H:%M")
+                except Exception:
+                    pass
         elif fermate[0].get("programmata") is not None:
             info["current_location"] = fermate[0].get("stazione")
             info["current_time"] = format_millis(fermate[0].get("programmata"))
@@ -223,10 +253,13 @@ def get_chat_config(chat_id):
         "train_url": chat.get("train_url", TRAIN_URL),
         "train_label": chat.get("train_label", TRAIN_LABEL),
         "pending_action": chat.get("pending_action"),
+        "check_interval_minutes": chat.get("check_interval_minutes", 1),
+        "notifications_enabled": chat.get("notifications_enabled", True),
+        "train_arrived": chat.get("train_arrived", False),
     }
 
 
-def set_chat_config(chat_id, train_label=None, train_url=None, pending_action=None):
+def set_chat_config(chat_id, train_label=None, train_url=None, pending_action=None, check_interval_minutes=None, notifications_enabled=None, train_arrived=None):
     state = load_state()
     chats = state.setdefault("chats", {})
     chat = chats.setdefault(get_chat_key(chat_id), {})
@@ -234,6 +267,24 @@ def set_chat_config(chat_id, train_label=None, train_url=None, pending_action=No
         chat["train_label"] = train_label
     if train_url is not None:
         chat["train_url"] = train_url
+    # interval
+    if check_interval_minutes is not None:
+        try:
+            chat["check_interval_minutes"] = int(check_interval_minutes)
+        except Exception:
+            chat["check_interval_minutes"] = 1
+    else:
+        chat.setdefault("check_interval_minutes", 1)
+    # notifications flag
+    if notifications_enabled is not None:
+        chat["notifications_enabled"] = bool(notifications_enabled)
+    else:
+        chat.setdefault("notifications_enabled", True)
+    # train arrived flag
+    if train_arrived is not None:
+        chat["train_arrived"] = bool(train_arrived)
+    else:
+        chat.setdefault("train_arrived", False)
     if pending_action is not None:
         chat["pending_action"] = pending_action
     elif "pending_action" in chat:
@@ -323,17 +374,40 @@ def build_status_text(info, train_label=None):
         lines.append(f"🔔 Stato: {info['status'].capitalize()}")
 
     if info.get("current_location") and info.get("current_time"):
-        lines.append(f"📍 Ultimo rilevamento: {info['current_location']} alle {info['current_time']}")
+        s = f"📍 Ultimo rilevamento: {info['current_location']} alle {info['current_time']}"
+        if info.get("current_time_scheduled"):
+            s = f"{s} (programmata {info['current_time_scheduled']})"
+        if info.get("current_time_computed"):
+            s = f"{s} (effettivo stimato {info['current_time_computed']})"
+        elif info.get("delay_minutes") is not None and info.get("current_time_scheduled"):
+            s = f"{s} (+{info['delay_minutes']} min)"
+        lines.append(s)
     elif info.get("current_location"):
-        lines.append(f"📍 Ultimo rilevamento: {info['current_location']}")
+        s = f"📍 Ultimo rilevamento: {info['current_location']}"
+        if info.get("current_time_scheduled"):
+            s = f"{s} (programmata {info['current_time_scheduled']})"
+        lines.append(s)
 
     if info.get("delay_minutes") is not None:
         lines.append(f"⏱ Ritardo: {info['delay_minutes']} min")
 
     if info.get("destination_arrival_actual"):
-        lines.append(f"🛬 Arrivato a {info['destination']} alle {info['destination_arrival_actual']}")
+        s = f"🛬 Arrivato a {info['destination']} alle {info['destination_arrival_actual']}"
+        if info.get("destination_arrival_scheduled"):
+            s = f"{s} (programmata {info['destination_arrival_scheduled']})"
+        if info.get("delay_minutes") is not None:
+            s = f"{s} (+{info['delay_minutes']} min)"
+        lines.append(s)
     elif info.get("destination_arrival_predicted"):
-        lines.append(f"🛬 Arrivo previsto a {info['destination']} alle {info['destination_arrival_predicted']}")
+        s = f"🛬 Arrivo previsto a {info['destination']} alle {info['destination_arrival_predicted']}"
+        if info.get("destination_arrival_scheduled") and info.get("destination_arrival_scheduled") != info.get("destination_arrival_predicted"):
+            s = f"{s} (programmata {info['destination_arrival_scheduled']})"
+        if info.get("delay_minutes") is not None:
+            if info.get("destination_arrival_computed"):
+                s = f"{s} (effettivo stimato {info['destination_arrival_computed']} / +{info['delay_minutes']} min)"
+            else:
+                s = f"{s} (+{info['delay_minutes']} min)"
+        lines.append(s)
     else:
         lines.append(f"🛬 Destinazione: {info.get('destination', 'Sconosciuta')}")
 
@@ -347,7 +421,8 @@ def build_menu_keyboard():
                 {"text": "🔄 Aggiorna ora", "callback_data": "CHECK_NOW"},
                 {"text": "📡 Ultimo stato", "callback_data": "STATUS"},
             ],
-            [{"text": "✏️ Imposta treno", "callback_data": "SET_TRAIN"}],
+            [{"text": "✏️ Imposta treno", "callback_data": "SET_TRAIN"}, {"text": "⏱ Frequenza", "callback_data": "SET_INTERVAL"}],
+            [{"text": "🔕 Disattiva notifiche", "callback_data": "DISABLE_NOTIF"}, {"text": "🔔 Riattiva notifiche", "callback_data": "ENABLE_NOTIF"}],
             [{"text": "ℹ️ Aiuto", "callback_data": "HELP"}],
         ]
     }
@@ -555,6 +630,17 @@ def handle_bot_command(message):
         return
 
     pending_action = chat_config.get("pending_action")
+    if pending_action == "set_interval":
+        # expect a number in minutes
+        try:
+            minutes = int(re.search(r"(\d+)", text).group(1))
+            if minutes < 1:
+                raise ValueError
+            set_chat_config(chat_id, check_interval_minutes=minutes, pending_action=None)
+            send_telegram_message(f"Frequenza impostata a {minutes} minuto(i).", chat_id=chat_id)
+        except Exception:
+            send_telegram_message("Valore non valido. Invia un numero intero (es. '1' per 1 minuto).", chat_id=chat_id)
+        return
     if pending_action == "set_train":
         new_label = normalize_train_label(text)
         if new_label:
@@ -598,6 +684,25 @@ def handle_callback_query(callback_query):
         answer_callback_query(callback_id)
         return
 
+    if data == "SET_INTERVAL":
+        set_chat_config(chat_id, pending_action="set_interval")
+        send_telegram_message("Invia il numero di minuti per la frequenza di controllo (es. 1).", chat_id=chat_id, reply_to_message_id=message_id)
+        answer_callback_query(callback_id)
+        return
+
+    if data == "DISABLE_NOTIF":
+        set_chat_config(chat_id, notifications_enabled=False)
+        send_telegram_message("Notifiche disattivate per questo treno. Usa il pulsante Riattiva notifiche per abilitarle.", chat_id=chat_id, reply_to_message_id=message_id)
+        answer_callback_query(callback_id)
+        return
+
+    if data == "ENABLE_NOTIF":
+        # re-enable notifications and clear train_arrived flag
+        set_chat_config(chat_id, notifications_enabled=True, train_arrived=False)
+        send_telegram_message("Notifiche riattivate per questo treno.", chat_id=chat_id, reply_to_message_id=message_id)
+        answer_callback_query(callback_id)
+        return
+
     if data == "HELP":
         send_telegram_message(build_help_text(), chat_id=chat_id, reply_to_message_id=message_id)
         answer_callback_query(callback_id)
@@ -611,6 +716,68 @@ def process_telegram_update(update):
         handle_bot_command(update["message"])
     elif "callback_query" in update:
         handle_callback_query(update["callback_query"])
+
+
+# Background scheduler to check chats periodically
+STATE_LOCK = threading.Lock()
+
+def scheduler_loop():
+    logging.info("Background scheduler started")
+    while True:
+        try:
+            state = load_state()
+            chats = state.get("chats", {})
+            now = time.time()
+            updated = False
+            for key, chat in list(chats.items()):
+                try:
+                    chat_id = int(key)
+                except Exception:
+                    continue
+                if not chat.get("notifications_enabled", True):
+                    continue
+                if chat.get("train_arrived"):
+                    continue
+                interval = int(chat.get("check_interval_minutes", 1))
+                last_run = chat.get("last_run", 0)
+                if now - float(last_run) >= max(1, interval) * 60:
+                    # update last_run and save early to avoid duplicate runs
+                    chat["last_run"] = now
+                    chats[key] = chat
+                    state["chats"] = chats
+                    save_state(state)
+                    updated = False
+                    try:
+                        result = run_check(force=False, chat_id=chat_id)
+                        info = result.get("info", {})
+                        status = (info.get("status") or "").lower()
+                        if status == "arrivato":
+                            # mark arrived and disable further notifications
+                            chat["train_arrived"] = True
+                            chat["notifications_enabled"] = False
+                            chats[key] = chat
+                            state["chats"] = chats
+                            save_state(state)
+                    except Exception:
+                        logging.exception("Error running scheduled check for chat %s", chat_id)
+            # sleep a short while
+        except Exception:
+            logging.exception("Scheduler loop error")
+        time.sleep(10)
+
+
+def should_start_scheduler():
+    if not START_SCHEDULER:
+        logging.info("Scheduler disabled by START_SCHEDULER=false")
+        return False
+    if GUNICORN_WORKER_ID is not None and GUNICORN_WORKER_ID != "1":
+        logging.info("Scheduler not started in gunicorn worker %s", GUNICORN_WORKER_ID)
+        return False
+    return True
+
+if should_start_scheduler():
+    _scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
+    _scheduler_thread.start()
 
 
 @app.route("/")

@@ -111,7 +111,26 @@ Invoke-RestMethod -Uri "https://api.telegram.org/bot$token/setWebhook" -Method P
 - `TRAIN_URL` — URL della pagina di Trenitalia per il treno (opzionale; il servizio crea l'endpoint REST automaticamente).
 - `TRAIN_LABEL` — numero del treno di default.
 - `SEND_ONLY_ON_CHANGE` — se `true` (default) invia messaggi solo quando lo stato cambia.
+- `START_SCHEDULER` — se `true` (default) avvia il controllo automatico interno.
 - `STATE_FILE_PATH` — percorso per `train_state.json` (se Render non offre persistenza, considera un DB esterno).
+
+## Scheduler interno e `gunicorn`
+
+Il servizio include un scheduler in background che controlla periodicamente lo stato dei treni salvati in `train_state.json`.
+
+- `START_SCHEDULER=true` abilita il scheduler.
+- In `gunicorn`, per evitare controlli duplicati, il scheduler parte solo se `GUNICORN_WORKER_ID` è `1`.
+- Se usi più worker, imposta il primo worker con `GUNICORN_WORKER_ID=1` e disabilita il scheduler sugli altri worker.
+
+## Pulsanti Telegram aggiuntivi
+
+Il menu include ora:
+
+- `⏱ Frequenza` — imposta l'intervallo in minuti per i controlli automatici (default 1 minuto).
+- `🔕 Disattiva notifiche` — disattiva le notifiche automatiche per il treno corrente.
+- `🔔 Riattiva notifiche` — riattiva le notifiche e resetta lo stato di arrivo.
+
+Quando il treno è segnalato come `arrivato`, il bot disattiva automaticamente le notifiche per quella chat e non invia altri messaggi automatici.
 
 ## Persistenza e Render
 
@@ -139,3 +158,13 @@ Il bot risponderà confermando il nuovo treno. In alternativa:
 ---
 
 Per altri dettagli tecnici, vedi `notify_train.py` e lo script di setup per Telegram se presente.
+
+## Nota sugli orari e il ritardo
+
+Le notifiche mostrano gli orari rilevati e, quando disponibile, indicano anche il ritardo tra parentesi. Ad esempio:
+
+```
+🛬 Arrivo previsto a Taranto alle 15:30 (+10 min)
+```
+
+Questo significa che l'orario visualizzato è l'orario previsto e che il treno ha un ritardo di 10 minuti. Se è disponibile l'orario effettivo di arrivo verrà mostrato allo stesso modo con il ritardo se presente.
