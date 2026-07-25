@@ -16,11 +16,14 @@ Questo progetto invia aggiornamenti Telegram per un treno Trenitalia.
 3. Assicurati che Render usi Python 3.12.
 4. Imposta queste variabili d'ambiente su Render:
    - `TELEGRAM_BOT_TOKEN`
-   - `TELEGRAM_CHAT_ID`
+   - `APP_URL`
    - `TRAIN_URL` (opzionale, default is the Trenitalia train page URL)
    - `TRAIN_LABEL` (opzionale, default `8807`)
    - `SEND_ONLY_ON_CHANGE` (opzionale, default `true`)
+   - `START_SCHEDULER` (opzionale, default `true`)
    - `STATE_FILE_PATH` (opzionale, default `train_state.json`)
+
+> Usa `.env.example` come modello locale, ma non committare file con valori segreti.
 
 ### Esempio `TRAIN_URL`
 Usa l'URL della pagina Trenitalia per il treno:
