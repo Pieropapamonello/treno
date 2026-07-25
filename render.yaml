@@ -1,0 +1,16 @@
+services:
+  - type: cron
+    name: train-notifier
+    env: python
+    plan: free
+    region: frankfurt
+    schedule: "*/10 * * * *"
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python notify_train.py"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      - key: SEND_ONLY_ON_CHANGE
+        value: true
+      - key: STATE_FILE_PATH
+        value: train_state.json
