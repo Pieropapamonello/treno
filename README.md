@@ -12,7 +12,7 @@ Questo progetto invia aggiornamenti Telegram per un treno Trenitalia.
 ## Come usare su GitHub + Render
 
 1. Carica questa cartella su un repository GitHub.
-2. Crea un nuovo servizio su Render configurato come cron job.
+2. Crea un nuovo servizio su Render come Web Service.
 3. Assicurati che Render usi Python 3.12.
 4. Imposta queste variabili d'ambiente su Render:
    - `TELEGRAM_BOT_TOKEN`
@@ -24,10 +24,20 @@ Questo progetto invia aggiornamenti Telegram per un treno Trenitalia.
 
 ## Esecuzione
 
-Render esegue il servizio ogni 10 minuti usando `python notify_train.py`.
+Render esegue il servizio come web app usando:
+
+```bash
+gunicorn notify_train:app --bind 0.0.0.0:$PORT
+```
+
+## Endpoint disponibili
+
+- `/` — conferma che il servizio è attivo.
+- `/check` — lancia un test di stato e invia un messaggio Telegram se necessario.
+- `/status` — mostra l'ultimo stato salvato.
 
 ## Note
 
 - Lo script salva l’ultimo stato del treno in `train_state.json`.
 - Viene inviato un messaggio Telegram solo se cambia lo stato, cambia il ritardo, o arriva a Taranto.
-- Se preferisci, puoi togliere `SEND_ONLY_ON_CHANGE=true` per inviare un messaggio a ogni esecuzione.
+- Se vuoi forzare il controllo anche senza cambio di stato, usa `/check?force=true`.

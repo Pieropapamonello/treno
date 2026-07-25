@@ -1,12 +1,12 @@
 services:
-  - type: cron
+  - type: web_service
     name: train-notifier
     env: python
     plan: free
     region: frankfurt
-    schedule: "*/10 * * * *"
+    branch: main
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python notify_train.py"
+    startCommand: "gunicorn notify_train:app --bind 0.0.0.0:$PORT"
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.0

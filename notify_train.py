@@ -2,7 +2,7 @@ import json
 import os
 import re
 import requests
-from datetime import datetime
+from flask import Flask, jsonify, request
 from bs4 import BeautifulSoup
 
 DEFAULT_TRAIN_URL = "http://www.viaggiatreno.it/infomobilitamobile/pages/cercaTreno/cercaTreno.jsp?treno=8807&origine=S01700&datapartenza=1784930400000"
@@ -12,6 +12,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 STATE_FILE_PATH = os.getenv("STATE_FILE_PATH", "train_state.json")
 SEND_ONLY_ON_CHANGE = os.getenv("SEND_ONLY_ON_CHANGE", "true").lower() in {"1", "true", "yes", "on"}
+
+app = Flask(__name__)
+app.config["JSON_SORT_KEYS"] = False
 
 
 def fetch_train_page():
@@ -64,11 +67,12 @@ def parse_train_info(html):
         info["destination_arrival_actual"] = actual.group(1)
 
     if info["status"] is None:
-        if "in coda" in text.lower():
+        lower_text = text.lower()
+        if "in coda" in lower_text:
             info["status"] = "in coda"
-        elif "in transito" in text.lower():
+        elif "in transito" in lower_text:
             info["status"] = "in transito"
-        elif "arrivato" in text.lower():
+        elif "arrivato" in lower_text:
             info["status"] = "arrivato"
 
     return info
@@ -142,32 +146,64 @@ def send_telegram_message(message):
     return True
 
 
-def main():
-    print("Starting train notifier...")
+def run_check(force=False):
     state = load_state()
     prev_info = state.get("last_info", {})
 
-    try:
-        html = fetch_train_page()
-        info = parse_train_info(html)
-    except Exception as exc:
-        print(f"Error fetching/parsing train page: {exc}")
-        return
+    html = fetch_train_page()
+    info = parse_train_info(html)
+    message = None
 
-    message = build_message(info, prev_info) if SEND_ONLY_ON_CHANGE else build_message(info, {})
+    if force:
+        message = build_message(info, {})
+    else:
+        message = build_message(info, prev_info) if SEND_ONLY_ON_CHANGE else build_message(info, {})
+
+    result = {
+        "train_label": TRAIN_LABEL,
+        "train_url": TRAIN_URL,
+        "info": info,
+        "send_only_on_change": SEND_ONLY_ON_CHANGE,
+        "message": None,
+        "sent": False,
+    }
 
     if message:
         try:
             send_telegram_message(message)
-            print(f"Sent: {message}")
+            result["message"] = message
+            result["sent"] = True
         except Exception as exc:
-            print(f"Error sending Telegram message: {exc}")
+            result["message"] = f"ERROR: {exc}"
     else:
-        print("No state change detected; no message sent.")
+        result["message"] = "No state change detected; no message sent."
 
     state["last_info"] = info
     save_state(state)
+    return result
+
+
+@app.route("/")
+def home():
+    return "Train notifier web service is running. Use /check to trigger a status update."
+
+
+@app.route("/check")
+def check():
+    force = request.args.get("force", "false").lower() in {"1", "true", "yes", "on"}
+    try:
+        result = run_check(force=force)
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/status")
+def status():
+    state = load_state()
+    return jsonify({"last_info": state.get("last_info", {}), "send_only_on_change": SEND_ONLY_ON_CHANGE})
 
 
 if __name__ == "__main__":
-    main()
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
