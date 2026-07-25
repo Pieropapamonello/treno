@@ -2,8 +2,16 @@ import json
 import os
 import re
 import requests
+from datetime import datetime
+from urllib.parse import parse_qs, urlparse
 from flask import Flask, jsonify, request
 from bs4 import BeautifulSoup
+
+try:
+    from zoneinfo import ZoneInfo
+    ROME_TZ = ZoneInfo("Europe/Rome")
+except Exception:
+    ROME_TZ = None
 
 DEFAULT_TRAIN_URL = "http://www.viaggiatreno.it/infomobilitamobile/pages/cercaTreno/cercaTreno.jsp?treno=8807&origine=S01700&datapartenza=1784930400000"
 TRAIN_URL = os.getenv("TRAIN_URL", DEFAULT_TRAIN_URL)
@@ -17,6 +25,37 @@ app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
 
 
+def format_millis(timestamp_ms):
+    if timestamp_ms is None:
+        return None
+    try:
+        ts = int(timestamp_ms) / 1000.0
+    except (TypeError, ValueError):
+        return None
+    if ROME_TZ is not None:
+        return datetime.fromtimestamp(ts, tz=ROME_TZ).strftime("%H:%M")
+    return datetime.utcfromtimestamp(ts).strftime("%H:%M")
+
+
+def build_rest_api_url(train_url):
+    if "/resteasy/viaggiatreno/andamentoTreno/" in train_url:
+        return train_url
+
+    parsed = urlparse(train_url)
+    params = parse_qs(parsed.query)
+    if "treno" in params and "origine" in params and "datapartenza" in params:
+        numero_treno = params["treno"][0]
+        origine = params["origine"][0]
+        data_partenza = params["datapartenza"][0]
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        if "/pages/" in parsed.path:
+            prefix = parsed.path.split("/pages/", 1)[0]
+        else:
+            prefix = parsed.path.rsplit("/", 1)[0]
+        return f"{base}{prefix}/resteasy/viaggiatreno/andamentoTreno/{origine}/{numero_treno}/{data_partenza}"
+    return None
+
+
 def fetch_train_page():
     response = requests.get(
         TRAIN_URL,
@@ -27,7 +66,23 @@ def fetch_train_page():
     return response.text
 
 
-def parse_train_info(html):
+def fetch_train_data():
+    api_url = build_rest_api_url(TRAIN_URL)
+    if api_url:
+        response = requests.get(
+            api_url,
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+        )
+        response.raise_for_status()
+        try:
+            return response.json()
+        except ValueError:
+            return response.text
+    return fetch_train_page()
+
+
+def parse_train_info_html(html):
     soup = BeautifulSoup(html, "html.parser")
     text = "\n".join(soup.stripped_strings)
 
@@ -76,6 +131,57 @@ def parse_train_info(html):
             info["status"] = "arrivato"
 
     return info
+
+
+def parse_train_info_json(data):
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except Exception:
+            return parse_train_info_html(data)
+
+    info = {
+        "current_location": None,
+        "current_time": None,
+        "delay_minutes": None,
+        "status": None,
+        "destination": data.get("destinazione") or "Taranto",
+        "destination_arrival_predicted": None,
+        "destination_arrival_actual": None,
+    }
+
+    info["delay_minutes"] = data.get("ritardo")
+    info["status"] = "arrivato" if data.get("arrivato") else "in transito"
+
+    fermate = data.get("fermate") or []
+    if fermate:
+        last_stop = fermate[-1]
+        if last_stop.get("arrivoReale") is not None:
+            info["destination_arrival_actual"] = format_millis(last_stop.get("arrivoReale"))
+        elif last_stop.get("arrivo_teorico") is not None:
+            info["destination_arrival_predicted"] = format_millis(last_stop.get("arrivo_teorico"))
+        elif last_stop.get("programmata") is not None:
+            info["destination_arrival_predicted"] = format_millis(last_stop.get("programmata"))
+
+        last_reached = None
+        for stop in reversed(fermate):
+            if stop.get("arrivoReale") is not None or stop.get("partenzaReale") is not None:
+                last_reached = stop
+                break
+        if last_reached:
+            info["current_location"] = last_reached.get("stazione")
+            info["current_time"] = format_millis(last_reached.get("arrivoReale") or last_reached.get("partenzaReale"))
+        elif fermate[0].get("programmata") is not None:
+            info["current_location"] = fermate[0].get("stazione")
+            info["current_time"] = format_millis(fermate[0].get("programmata"))
+
+    return info
+
+
+def parse_train_info(data):
+    if isinstance(data, dict):
+        return parse_train_info_json(data)
+    return parse_train_info_html(data)
 
 
 def load_state():
@@ -150,8 +256,8 @@ def run_check(force=False):
     state = load_state()
     prev_info = state.get("last_info", {})
 
-    html = fetch_train_page()
-    info = parse_train_info(html)
+    data = fetch_train_data()
+    info = parse_train_info(data)
     message = None
 
     if force:

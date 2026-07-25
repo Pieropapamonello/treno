@@ -17,10 +17,19 @@ Questo progetto invia aggiornamenti Telegram per un treno Trenitalia.
 4. Imposta queste variabili d'ambiente su Render:
    - `TELEGRAM_BOT_TOKEN`
    - `TELEGRAM_CHAT_ID`
-   - `TRAIN_URL` (opzionale)
-   - `TRAIN_LABEL` (opzionale)
+   - `TRAIN_URL` (opzionale, default is the Trenitalia train page URL)
+   - `TRAIN_LABEL` (opzionale, default `8807`)
    - `SEND_ONLY_ON_CHANGE` (opzionale, default `true`)
    - `STATE_FILE_PATH` (opzionale, default `train_state.json`)
+
+### Esempio `TRAIN_URL`
+Usa l'URL della pagina Trenitalia per il treno:
+
+```text
+http://www.viaggiatreno.it/infomobilitamobile/pages/cercaTreno/cercaTreno.jsp?treno=8807&origine=S01700&datapartenza=1784930400000
+```
+
+Il servizio genera automaticamente l'endpoint REST interno per `andamentoTreno` dal valore di `TRAIN_URL`.
 
 ## Esecuzione
 
