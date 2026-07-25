@@ -2,6 +2,7 @@
 import os
 import re
 import requests
+import logging
 from datetime import datetime
 from urllib.parse import parse_qs, urlparse
 from flask import Flask, jsonify, request
@@ -23,6 +24,9 @@ SEND_ONLY_ON_CHANGE = os.getenv("SEND_ONLY_ON_CHANGE", "true").lower() in {"1", 
 
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
+
+# basic logging for debugging webhook/commands
+logging.basicConfig(level=logging.INFO)
 
 
 def format_millis(timestamp_ms):
@@ -282,10 +286,16 @@ def fetch_train_page(train_url=None):
     return response.text
 
 
-def fetch_train_data(train_url=None):
+def fetch_train_data(train_url=None, train_label=None):
     if train_url is None:
         train_url = TRAIN_URL
     api_url = build_rest_api_url(train_url)
+    # if a specific train_label was requested, try to construct a REST URL for it
+    if train_label is not None:
+        custom_api = build_resteasy_url_with_train(train_url, train_label)
+        if custom_api:
+            api_url = custom_api
+    logging.info("fetch_train_data called: train_url=%s train_label=%s api_url=%s", train_url, train_label, api_url)
     if api_url:
         response = requests.get(
             api_url,
@@ -475,6 +485,26 @@ def answer_callback_query(callback_query_id, text=None, show_alert=False):
     return True
 
 
+def register_bot_commands():
+    """Register bot commands so Telegram shows them in the client UI."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setMyCommands"
+    payload = {
+        "commands": [
+            {"command": "settrain", "description": "Imposta il treno da seguire"},
+            {"command": "check", "description": "Controlla lo stato del treno ora"},
+            {"command": "status", "description": "Mostra l'ultimo stato salvato"},
+            {"command": "help", "description": "Mostra la guida del bot"},
+        ]
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        logging.info("setMyCommands: %s %s", resp.status_code, resp.text)
+    except Exception as exc:
+        logging.warning("Failed to register bot commands: %s", exc)
+
+
 def handle_bot_command(message):
     chat_id = message["chat"]["id"]
     text = message.get("text", "").strip()
@@ -639,11 +669,12 @@ def home():
 @app.route("/telegram_webhook", methods=["POST"])
 def telegram_webhook():
     update = request.get_json(force=True)
+    logging.info("Incoming telegram update: %s", json.dumps(update))
     try:
         process_telegram_update(update)
         return jsonify({"ok": True})
     except Exception as exc:
-        print(f"Telegram webhook error: {exc}")
+        logging.exception("Telegram webhook error")
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
