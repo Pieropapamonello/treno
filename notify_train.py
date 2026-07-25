@@ -218,6 +218,66 @@ def parse_train_info(data):
     return parse_train_info_html(data)
 
 
+def parse_time_to_minutes(time_text):
+    if not time_text:
+        return None
+    try:
+        parts = [int(p) for p in time_text.split(":")]
+        if len(parts) != 2:
+            return None
+        return parts[0] * 60 + parts[1]
+    except Exception:
+        return None
+
+
+def has_significant_time_change(new_time, old_time, threshold_minutes=2):
+    if new_time == old_time:
+        return False
+    new_minutes = parse_time_to_minutes(new_time)
+    old_minutes = parse_time_to_minutes(old_time)
+    if new_minutes is None or old_minutes is None:
+        return True
+    return abs(new_minutes - old_minutes) >= threshold_minutes
+
+
+def has_significant_delay_change(new_delay, old_delay, threshold_minutes=2):
+    if new_delay == old_delay:
+        return False
+    if new_delay is None or old_delay is None:
+        return True
+    return abs(int(new_delay) - int(old_delay)) >= threshold_minutes
+
+
+def should_send_change_notification(info, prev_info):
+    if not prev_info:
+        return True
+
+    if info.get("status") != prev_info.get("status"):
+        return True
+    if info.get("destination") != prev_info.get("destination"):
+        return True
+    if info.get("current_location") != prev_info.get("current_location"):
+        return True
+    if info.get("destination_arrival_actual") != prev_info.get("destination_arrival_actual"):
+        return True
+    if info.get("destination_arrival_predicted") != prev_info.get("destination_arrival_predicted"):
+        return True
+
+    if has_significant_time_change(info.get("current_time"), prev_info.get("current_time")):
+        return True
+    if has_significant_time_change(info.get("current_time_scheduled"), prev_info.get("current_time_scheduled")):
+        return True
+    if has_significant_time_change(info.get("destination_arrival_scheduled"), prev_info.get("destination_arrival_scheduled")):
+        return True
+    if has_significant_time_change(info.get("destination_arrival_computed"), prev_info.get("destination_arrival_computed")):
+        return True
+
+    if has_significant_delay_change(info.get("delay_minutes"), prev_info.get("delay_minutes")):
+        return True
+
+    return False
+
+
 def load_state():
     try:
         with open(STATE_FILE_PATH, "r", encoding="utf-8") as fp:
@@ -452,7 +512,7 @@ def build_message(info, prev_info, force=False, train_label=None):
         return build_status_text(info, train_label=train_label)
     if not prev_info:
         return build_status_text(info, train_label=train_label)
-    if info != prev_info:
+    if should_send_change_notification(info, prev_info):
         return build_status_text(info, train_label=train_label)
     return None
 
