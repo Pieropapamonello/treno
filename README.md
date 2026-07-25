@@ -50,3 +50,92 @@ gunicorn notify_train:app --bind 0.0.0.0:$PORT
 - Lo script salva l’ultimo stato del treno in `train_state.json`.
 - Viene inviato un messaggio Telegram solo se cambia lo stato, cambia il ritardo, o arriva a Taranto.
 - Se vuoi forzare il controllo anche senza cambio di stato, usa `/check?force=true`.
+
+## Come impostare il treno (comandi Telegram)
+
+Ci sono due modi per impostare quale treno seguire per una chat/gruppo:
+
+- Comando diretto: usa il comando `/settrain` seguito dal numero del treno. Esempi:
+
+```text
+/settrain 8807          # imposta il treno 8807 immediatamente
+/settrain               # il bot chiederà di inviare il numero del treno
+```
+
+Se invii `/settrain` senza argomenti, il bot imposterà la chat in modalità "attendo numero"; il messaggio successivo che contiene un numero verrà preso come nuovo treno.
+
+- Menu: usa il comando `/menu` (o il pulsante Menu nel bot) per visualizzare la tastiera con i pulsanti. Premi `✏️ Imposta treno` per impostare il treno tramite interazione guidata.
+
+Quando il treno è impostato per una chat, la configurazione è salvata separatamente per ogni chat in `train_state.json` (campo `chats`).
+
+## Comandi Telegram disponibili
+
+- `/settrain [numero]` — imposta il treno per la chat corrente.
+- `/menu` — apre la tastiera con pulsanti rapidi (Aggiorna ora, Ultimo stato, Imposta treno, Aiuto).
+- `/check` — richiede un aggiornamento immediato (puoi forzare con `?force=true` se richiesto via HTTP).
+- `/status` — mostra l'ultimo stato salvato per la chat.
+- `/help` — mostra la guida.
+
+## Come settare il webhook e i comandi (esempi)
+
+Esempio PowerShell per ottenere informazioni webhook:
+
+```powershell
+$token = "<TELEGRAM_BOT_TOKEN>"
+Invoke-RestMethod -Uri "https://api.telegram.org/bot$token/getWebhookInfo" | ConvertTo-Json -Depth 10
+```
+
+Esempio per registrare i comandi del bot (usato anche dallo script `notify_train.register_bot_commands()`):
+
+```bash
+curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setMyCommands" -H "Content-Type: application/json" -d '{"commands":[{"command":"settrain","description":"Imposta il treno da seguire"},{"command":"menu","description":"Apri il menu dei pulsanti"},{"command":"check","description":"Controlla lo stato del treno ora"},{"command":"status","description":"Mostra l\'ultimo stato salvato"},{"command":"help","description":"Mostra la guida del bot"}]}'
+```
+
+Esempio per impostare il webhook (sostituisci l'URL con quello del tuo servizio su Render):
+
+```bash
+curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" -d "url=https://<your-render-service>.onrender.com/telegram_webhook"
+```
+
+Oppure in PowerShell:
+
+```powershell
+$token = "<TELEGRAM_BOT_TOKEN>"
+Invoke-RestMethod -Uri "https://api.telegram.org/bot$token/setWebhook" -Method Post -Body @{ url = "https://<your-render-service>.onrender.com/telegram_webhook" }
+```
+
+## Variabili d'ambiente importanti
+
+- `TELEGRAM_BOT_TOKEN` — token del bot Telegram (mai committare questo valore).
+- `TELEGRAM_CHAT_ID` — chat di default per inviare notifiche (opzionale se usi bot in chat specifiche).
+- `TRAIN_URL` — URL della pagina di Trenitalia per il treno (opzionale; il servizio crea l'endpoint REST automaticamente).
+- `TRAIN_LABEL` — numero del treno di default.
+- `SEND_ONLY_ON_CHANGE` — se `true` (default) invia messaggi solo quando lo stato cambia.
+- `STATE_FILE_PATH` — percorso per `train_state.json` (se Render non offre persistenza, considera un DB esterno).
+
+## Persistenza e Render
+
+Il file `train_state.json` viene salvato nel filesystem dell'applicazione. Su Render il filesystem è in genere effimero tra deploy; se vuoi che la configurazione e lo stato sopravvivano ai deploy/ridimensionamenti, valuta una soluzione con storage persistente (ad es. un bucket S3, un piccolo DB come Redis o Postgres, o Render Persistent Disks se disponibile).
+
+## Sicurezza e git
+
+- NON committare mai `train_state.json` o il token del bot nel repository. Aggiungi `train_state.json` al `.gitignore` se non già presente.
+- Le variabili segrete devono essere gestite tramite l'interfaccia di Render (Environment > Add Environment Variable).
+
+## Esempio rapido: cambiare treno dalla chat
+
+1. In chat privata o nel gruppo scrivi:
+
+```text
+/settrain 1234
+```
+
+Il bot risponderà confermando il nuovo treno. In alternativa:
+
+1. Scrivi `/menu`.
+2. Premi `✏️ Imposta treno`.
+3. Invia il numero del treno come messaggio successivo.
+
+---
+
+Per altri dettagli tecnici, vedi `notify_train.py` e lo script di setup per Telegram se presente.
