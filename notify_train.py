@@ -493,6 +493,7 @@ def register_bot_commands():
     payload = {
         "commands": [
             {"command": "settrain", "description": "Imposta il treno da seguire"},
+            {"command": "menu", "description": "Apri il menu dei pulsanti"},
             {"command": "check", "description": "Controlla lo stato del treno ora"},
             {"command": "status", "description": "Mostra l'ultimo stato salvato"},
             {"command": "help", "description": "Mostra la guida del bot"},
@@ -512,19 +513,15 @@ def handle_bot_command(message):
     train_label = chat_config["train_label"]
 
     if text.startswith("/start"):
-        send_telegram_message(
-            build_welcome_text(),
-            chat_id=chat_id,
-            reply_markup=build_menu_keyboard(),
-        )
+        send_telegram_message(build_welcome_text(), chat_id=chat_id)
         return
 
     if text.startswith("/help"):
-        send_telegram_message(
-            build_help_text(),
-            chat_id=chat_id,
-            reply_markup=build_menu_keyboard(),
-        )
+        send_telegram_message(build_help_text(), chat_id=chat_id)
+        return
+
+    if text.startswith("/menu"):
+        send_telegram_message("Seleziona un'azione dal menu:", chat_id=chat_id, reply_markup=build_menu_keyboard())
         return
 
     if text.startswith("/settrain"):
@@ -534,26 +531,17 @@ def handle_bot_command(message):
             if new_label:
                 set_chat_config(chat_id, train_label=new_label, pending_action=None)
                 send_telegram_message(
-                    f"Treno impostato su {new_label}. Ora usa /check o il pulsante per aggiornare lo stato.",
+                    f"Treno impostato su {new_label}. Ora usa /check o /menu per aggiornare lo stato.",
                     chat_id=chat_id,
-                    reply_markup=build_menu_keyboard(),
                 )
                 return
         set_chat_config(chat_id, pending_action="set_train")
-        send_telegram_message(
-            "Inserisci il numero del treno da seguire.",
-            chat_id=chat_id,
-            reply_markup=build_menu_keyboard(),
-        )
+        send_telegram_message("Inserisci il numero del treno da seguire.", chat_id=chat_id)
         return
 
     if text.startswith("/check"):
         result = check_train_state(force=True, chat_id=chat_id)
-        send_telegram_message(
-            build_status_text(result["info"], train_label=result["train_label"]),
-            chat_id=chat_id,
-            reply_markup=build_menu_keyboard(),
-        )
+        send_telegram_message(build_status_text(result["info"], train_label=result["train_label"]), chat_id=chat_id)
         return
 
     if text.startswith("/status"):
@@ -563,11 +551,7 @@ def handle_bot_command(message):
             result = check_train_state(force=True, chat_id=chat_id)
             info = result["info"]
             train_label = result["train_label"]
-        send_telegram_message(
-            build_status_text(info, train_label=train_label),
-            chat_id=chat_id,
-            reply_markup=build_menu_keyboard(),
-        )
+        send_telegram_message(build_status_text(info, train_label=train_label), chat_id=chat_id)
         return
 
     pending_action = chat_config.get("pending_action")
@@ -575,24 +559,12 @@ def handle_bot_command(message):
         new_label = normalize_train_label(text)
         if new_label:
             set_chat_config(chat_id, train_label=new_label, pending_action=None)
-            send_telegram_message(
-                f"Treno aggiornato a {new_label}. Ora puoi usare /check per vedere lo stato.",
-                chat_id=chat_id,
-                reply_markup=build_menu_keyboard(),
-            )
+            send_telegram_message(f"Treno aggiornato a {new_label}. Ora puoi usare /check per vedere lo stato.", chat_id=chat_id)
             return
-        send_telegram_message(
-            "Non ho trovato un numero treno valido. Invia solo il numero del treno.",
-            chat_id=chat_id,
-            reply_markup=build_menu_keyboard(),
-        )
+        send_telegram_message("Non ho trovato un numero treno valido. Invia solo il numero del treno.", chat_id=chat_id)
         return
 
-    send_telegram_message(
-        "Non riconosco questo comando. Usa /help per vedere le opzioni.",
-        chat_id=chat_id,
-        reply_markup=build_menu_keyboard(),
-    )
+    send_telegram_message("Non riconosco questo comando. Usa /help per vedere le opzioni.", chat_id=chat_id)
 
 
 def handle_callback_query(callback_query):
@@ -605,12 +577,7 @@ def handle_callback_query(callback_query):
 
     if data == "CHECK_NOW":
         result = check_train_state(force=True, chat_id=chat_id)
-        send_telegram_message(
-            build_status_text(result["info"], train_label=result["train_label"]),
-            chat_id=chat_id,
-            reply_to_message_id=message_id,
-            reply_markup=build_menu_keyboard(),
-        )
+        send_telegram_message(build_status_text(result["info"], train_label=result["train_label"]), chat_id=chat_id, reply_to_message_id=message_id)
         answer_callback_query(callback_id, text="Aggiornato!")
         return
 
@@ -621,33 +588,18 @@ def handle_callback_query(callback_query):
             result = check_train_state(force=True, chat_id=chat_id)
             info = result["info"]
             train_label = result["train_label"]
-        send_telegram_message(
-            build_status_text(info, train_label=train_label),
-            chat_id=chat_id,
-            reply_to_message_id=message_id,
-            reply_markup=build_menu_keyboard(),
-        )
+        send_telegram_message(build_status_text(info, train_label=train_label), chat_id=chat_id, reply_to_message_id=message_id)
         answer_callback_query(callback_id)
         return
 
     if data == "SET_TRAIN":
         set_chat_config(chat_id, pending_action="set_train")
-        send_telegram_message(
-            "Invia ora il numero del treno da seguire.",
-            chat_id=chat_id,
-            reply_to_message_id=message_id,
-            reply_markup=build_menu_keyboard(),
-        )
+        send_telegram_message("Invia ora il numero del treno da seguire.", chat_id=chat_id, reply_to_message_id=message_id)
         answer_callback_query(callback_id)
         return
 
     if data == "HELP":
-        send_telegram_message(
-            build_help_text(),
-            chat_id=chat_id,
-            reply_to_message_id=message_id,
-            reply_markup=build_menu_keyboard(),
-        )
+        send_telegram_message(build_help_text(), chat_id=chat_id, reply_to_message_id=message_id)
         answer_callback_query(callback_id)
         return
 
