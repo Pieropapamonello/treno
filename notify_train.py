@@ -557,12 +557,55 @@ def check_train_state(force=False, chat_id=None):
 def run_check(force=False, chat_id=None):
     result = check_train_state(force=force, chat_id=chat_id)
     if result["message"] and chat_id is not None:
-        send_telegram_message(result["message"], chat_id=chat_id)
+        send_update_message(result["message"], chat_id=chat_id)
         result["sent"] = True
     elif result["message"] and chat_id is None:
-        send_telegram_message(result["message"])
+        send_update_message(result["message"])
         result["sent"] = True
     return result
+
+
+def delete_telegram_message(chat_id, message_id):
+    if chat_id is None or message_id is None:
+        return False
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("Telegram credentials not configured.")
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+    }
+    response = requests.post(url, data=payload, timeout=15)
+    if response.status_code != 200:
+        try:
+            error_data = response.json()
+            description = error_data.get("description")
+        except Exception:
+            description = response.text
+        logging.warning("Telegram deleteMessage error %s: %s", response.status_code, description)
+        return False
+    return True
+
+
+def get_last_update_message_id(chat_id):
+    if chat_id is None:
+        state = load_state()
+        return state.get("last_update_message_id")
+    return get_chat_state(chat_id).get("last_update_message_id")
+
+
+def save_last_update_message_id(chat_id, message_id):
+    state = load_state()
+    if chat_id is None:
+        state["last_update_message_id"] = message_id
+    else:
+        chats = state.setdefault("chats", {})
+        chat = chats.setdefault(get_chat_key(chat_id), {})
+        chat["last_update_message_id"] = message_id
+        chats[get_chat_key(chat_id)] = chat
+        state["chats"] = chats
+    save_state(state)
 
 
 def send_telegram_message(message, chat_id=None, reply_to_message_id=None, reply_markup=None):
@@ -593,7 +636,21 @@ def send_telegram_message(message, chat_id=None, reply_to_message_id=None, reply
         raise RuntimeError(
             f"Telegram API error {response.status_code}: {description}"
         )
-    return True
+    return response.json().get("result")
+
+
+def send_update_message(message, chat_id=None, reply_to_message_id=None, reply_markup=None):
+    previous_message_id = get_last_update_message_id(chat_id)
+    if previous_message_id:
+        try:
+            delete_telegram_message(chat_id, previous_message_id)
+        except Exception:
+            logging.warning("Could not delete previous update message for chat %s", chat_id)
+
+    result = send_telegram_message(message, chat_id=chat_id, reply_to_message_id=reply_to_message_id, reply_markup=reply_markup)
+    if result and isinstance(result, dict):
+        save_last_update_message_id(chat_id, result.get("message_id"))
+    return result
 
 
 def answer_callback_query(callback_query_id, text=None, show_alert=False):
@@ -676,7 +733,7 @@ def handle_bot_command(message):
 
     if text.startswith("/check"):
         result = check_train_state(force=True, chat_id=chat_id)
-        send_telegram_message(build_status_text(result["info"], train_label=result["train_label"]), chat_id=chat_id)
+        send_update_message(build_status_text(result["info"], train_label=result["train_label"]), chat_id=chat_id)
         return
 
     if text.startswith("/status"):
@@ -686,7 +743,7 @@ def handle_bot_command(message):
             result = check_train_state(force=True, chat_id=chat_id)
             info = result["info"]
             train_label = result["train_label"]
-        send_telegram_message(build_status_text(info, train_label=train_label), chat_id=chat_id)
+        send_update_message(build_status_text(info, train_label=train_label), chat_id=chat_id)
         return
 
     pending_action = chat_config.get("pending_action")
@@ -723,7 +780,11 @@ def handle_callback_query(callback_query):
 
     if data == "CHECK_NOW":
         result = check_train_state(force=True, chat_id=chat_id)
-        send_telegram_message(build_status_text(result["info"], train_label=result["train_label"]), chat_id=chat_id, reply_to_message_id=message_id)
+        send_update_message(
+            build_status_text(result["info"], train_label=result["train_label"]),
+            chat_id=chat_id,
+            reply_to_message_id=message_id,
+        )
         answer_callback_query(callback_id, text="Aggiornato!")
         return
 
@@ -734,7 +795,11 @@ def handle_callback_query(callback_query):
             result = check_train_state(force=True, chat_id=chat_id)
             info = result["info"]
             train_label = result["train_label"]
-        send_telegram_message(build_status_text(info, train_label=train_label), chat_id=chat_id, reply_to_message_id=message_id)
+        send_update_message(
+            build_status_text(info, train_label=train_label),
+            chat_id=chat_id,
+            reply_to_message_id=message_id,
+        )
         answer_callback_query(callback_id)
         return
 
