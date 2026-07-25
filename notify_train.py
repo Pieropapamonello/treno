@@ -588,11 +588,11 @@ def handle_bot_command(message):
     train_label = chat_config["train_label"]
 
     if text.startswith("/start"):
-        send_telegram_message(build_welcome_text(), chat_id=chat_id)
+        send_telegram_message(build_welcome_text(), chat_id=chat_id, reply_markup=build_menu_keyboard())
         return
 
     if text.startswith("/help"):
-        send_telegram_message(build_help_text(), chat_id=chat_id)
+        send_telegram_message(build_help_text(), chat_id=chat_id, reply_markup=build_menu_keyboard())
         return
 
     if text.startswith("/menu"):

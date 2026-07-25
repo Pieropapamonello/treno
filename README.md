@@ -65,6 +65,7 @@ Ci sono due modi per impostare quale treno seguire per una chat/gruppo:
 Se invii `/settrain` senza argomenti, il bot imposterà la chat in modalità "attendo numero"; il messaggio successivo che contiene un numero verrà preso come nuovo treno.
 
 - Menu: usa il comando `/menu` (o il pulsante Menu nel bot) per visualizzare la tastiera con i pulsanti. Premi `✏️ Imposta treno` per impostare il treno tramite interazione guidata.
+- `/start` e `/help` mostrano automaticamente la tastiera del menu, inclusi i pulsanti `⏱ Frequenza`, `🔕 Disattiva notifiche` e `🔔 Riattiva notifiche`.
 
 Quando il treno è impostato per una chat, la configurazione è salvata separatamente per ogni chat in `train_state.json` (campo `chats`).
 
